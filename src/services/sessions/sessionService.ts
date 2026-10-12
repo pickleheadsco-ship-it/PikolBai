@@ -1,0 +1,1395 @@
+import {
+  collection,
+  doc,
+  setDoc,
+  getDoc,
+  getDocs,
+  updateDoc,
+  deleteDoc,
+  query,
+  where,
+  orderBy,
+  serverTimestamp,
+  writeBatch,
+  runTransaction,
+  Timestamp,
+} from 'firebase/firestore';
+import { db } from '../firebase/config';
+import { handleFirestoreError, OperationType } from '../firebase/errors';
+import {
+  Session,
+  Participant,
+  Court,
+  Match,
+  MatchingMode,
+  SkillLevel,
+  GroupMatchProposal,
+  MatchScore,
+  AnnouncementSettings,
+} from '../../types';
+
+// Helper to generate 6-character alphanumeric join code
+export function generateJoinCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Avoid 0/O, 1/I confusion
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+export interface CreateSessionParams {
+  name: string;
+  venueName: string;
+  numberOfCourts: number;
+  matchingMode: MatchingMode;
+  maxPlayers?: number;
+  organizerId: string;
+  organizerEmail?: string;
+  announcementSettings?: {
+    enabled: boolean;
+    volume: number;
+    rate: number;
+    pitch: number;
+  };
+}
+
+export function cacheSessionLocally(session: Session, courts: Court[]) {
+  try {
+    localStorage.setItem(`picklequeue_session_${session.id}`, JSON.stringify(session));
+    localStorage.setItem(`picklequeue_courts_${session.id}`, JSON.stringify(courts));
+    const recent: string[] = JSON.parse(localStorage.getItem('picklequeue_recent_sessions') || '[]');
+    if (!recent.includes(session.id)) {
+      recent.unshift(session.id);
+      localStorage.setItem('picklequeue_recent_sessions', JSON.stringify(recent.slice(0, 15)));
+    }
+  } catch (e) {
+    console.warn('Could not cache session locally:', e);
+  }
+}
+
+export function getCachedSession(sessionId: string): { session: Session; courts: Court[] } | null {
+  try {
+    const rawSession = localStorage.getItem(`picklequeue_session_${sessionId}`);
+    const rawCourts = localStorage.getItem(`picklequeue_courts_${sessionId}`);
+    if (rawSession) {
+      return {
+        session: JSON.parse(rawSession),
+        courts: rawCourts ? JSON.parse(rawCourts) : [],
+      };
+    }
+  } catch (e) {
+    console.warn('Could not read cached session:', e);
+  }
+  return null;
+}
+
+export function getRecentLocalSessions(): Session[] {
+  try {
+    const recent: string[] = JSON.parse(localStorage.getItem('picklequeue_recent_sessions') || '[]');
+    const result: Session[] = [];
+    for (const sId of recent) {
+      const cached = getCachedSession(sId);
+      if (cached && cached.session && cached.session.status !== 'completed') {
+        result.push(cached.session);
+      }
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+export async function createSession(params: CreateSessionParams): Promise<string> {
+  const sessionRef = doc(collection(db, 'sessions'));
+  const sessionId = sessionRef.id;
+  const joinCode = generateJoinCode();
+  const nowIso = new Date().toISOString();
+
+  const sessionData: Omit<Session, 'id'> = {
+    venueId: 'v-default',
+    venueName: params.venueName.trim() || 'Community Pickleball Center',
+    name: params.name.trim() || 'Friday Night Open Play',
+    sport: 'pickleball',
+    status: 'active',
+    matchingMode: params.matchingMode || 'balanced',
+    numberOfCourts: params.numberOfCourts || 3,
+    maxPlayers: params.maxPlayers || 60,
+    joinCode,
+    organizerId: params.organizerId,
+    organizerEmail: params.organizerEmail || '',
+    announcementSettings: params.announcementSettings || {
+      enabled: true,
+      volume: 1,
+      rate: 1,
+      pitch: 1,
+    },
+    startedAt: serverTimestamp(),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  const initialCourts: Court[] = [];
+  const count = params.numberOfCourts || 3;
+  for (let i = 1; i <= count; i++) {
+    const courtId = `court-${i}`;
+    initialCourts.push({
+      courtId,
+      name: `Court ${i}`,
+      status: 'available',
+      currentMatchId: null,
+      available: true,
+      order: i,
+    });
+  }
+
+  // Pre-seed local storage immediately with valid date strings so that opening the terminal is instant
+  const sessionRecord = {
+    id: sessionId,
+    ...sessionData,
+    startedAt: nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  } as Session;
+  cacheSessionLocally(sessionRecord, initialCourts);
+
+  try {
+    const batch = writeBatch(db);
+    batch.set(sessionRef, sessionData);
+
+    // Seed deterministic default courts (Court 1, Court 2, etc.)
+    for (let i = 1; i <= count; i++) {
+      const courtId = `court-${i}`;
+      const courtRef = doc(db, `sessions/${sessionId}/courts`, courtId);
+      const courtData: Court = {
+        courtId,
+        name: `Court ${i}`,
+        status: 'available',
+        currentMatchId: null,
+        available: true,
+        order: i,
+        updatedAt: serverTimestamp(),
+      };
+      batch.set(courtRef, courtData);
+    }
+
+    // Commit to Firestore with a safe timeout race so terminal launch is instantaneous even on slow networks
+    try {
+      await Promise.race([
+        batch.commit(),
+        new Promise((resolve) => setTimeout(resolve, 1200)),
+      ]);
+    } catch (commitErr) {
+      console.warn('Firestore batch commit deferred or failed:', commitErr);
+    }
+
+    // Fire-and-forget audit event so it never blocks session launch
+    const auditRef = doc(collection(db, `sessions/${sessionId}/audit_logs`));
+    setDoc(auditRef, {
+      id: auditRef.id,
+      sessionId,
+      action: 'SESSION_STARTED',
+      actorId: params.organizerId,
+      actorName: params.organizerEmail || 'Organizer',
+      timestamp: serverTimestamp(),
+      metadata: { numberOfCourts: params.numberOfCourts, matchingMode: params.matchingMode },
+    }).catch((err) => console.warn('Audit log write error:', err));
+
+    return sessionId;
+  } catch (error) {
+    console.warn('Firestore session create warning (proceeding with local session):', error);
+    return sessionId;
+  }
+}
+
+export async function getSessionByJoinCode(code: string): Promise<Session | null> {
+  const cleanCode = code.trim().toUpperCase();
+  const q = query(
+    collection(db, 'sessions'),
+    where('joinCode', '==', cleanCode),
+    where('status', 'in', ['active', 'paused', 'draft'])
+  );
+
+  try {
+    const snap = await getDocs(q);
+    if (snap.empty) {
+      // Check local cache for recent matching code
+      const recent = JSON.parse(localStorage.getItem('picklequeue_recent_sessions') || '[]');
+      for (const id of recent) {
+        const cached = getCachedSession(id);
+        if (cached && cached.session.joinCode === cleanCode) {
+          return cached.session;
+        }
+      }
+      return null;
+    }
+    const docSnap = snap.docs[0];
+    return { id: docSnap.id, ...docSnap.data() } as Session;
+  } catch (error) {
+    console.warn('Error querying by join code, checking local cache:', error);
+    try {
+      const recent = JSON.parse(localStorage.getItem('picklequeue_recent_sessions') || '[]');
+      for (const id of recent) {
+        const cached = getCachedSession(id);
+        if (cached && cached.session.joinCode === cleanCode) {
+          return cached.session;
+        }
+      }
+    } catch {}
+    return null;
+  }
+}
+
+export async function joinSessionAsParticipant(
+  sessionId: string,
+  params: {
+    participantId?: string;
+    name: string;
+    firstName?: string;
+    surname?: string;
+    avatarUrl?: string;
+    skillLevel: SkillLevel;
+  }
+): Promise<Participant> {
+  const participantsRef = collection(db, `sessions/${sessionId}/participants`);
+
+  try {
+    // 1. Double-entry prevention: check if player already exists in active queue
+    const snapshot = await getDocs(participantsRef);
+    const trimmedName = params.name.trim().toLowerCase();
+
+    const existingMatch = snapshot.docs
+      .map((d) => ({ participantId: d.id, ...d.data() } as Participant))
+      .find(
+        (p) =>
+          p.status !== 'left' &&
+          (p.name?.trim().toLowerCase() === trimmedName ||
+            (params.firstName &&
+              params.surname &&
+              p.firstName?.trim().toLowerCase() === params.firstName.trim().toLowerCase() &&
+              p.surname?.trim().toLowerCase() === params.surname.trim().toLowerCase()))
+      );
+
+    // If already in queue, return existing participant to prevent duplicate entry
+    if (existingMatch) {
+      return existingMatch;
+    }
+
+    const participantDoc = params.participantId
+      ? doc(db, `sessions/${sessionId}/participants`, params.participantId)
+      : doc(participantsRef);
+    const pId = participantDoc.id;
+
+    // Determine current max queue position
+    let maxPos = 0;
+    snapshot.forEach((d) => {
+      const pos = d.data().queuePosition || 0;
+      if (pos > maxPos) maxPos = pos;
+    });
+
+    const newParticipant: Participant = {
+      participantId: pId,
+      sessionId,
+      name: params.name.trim(),
+      firstName: params.firstName?.trim() || '',
+      surname: params.surname?.trim() || '',
+      avatarUrl: params.avatarUrl || '',
+      skillLevel: params.skillLevel,
+      status: 'waiting',
+      queuePosition: maxPos + 1,
+      queueEnteredAt: serverTimestamp(),
+      gamesPlayed: 0,
+      wins: 0,
+      losses: 0,
+      winRate: 0,
+      resting: false,
+      checkedIn: true,
+      joinedAt: serverTimestamp(),
+      previousPartnerIds: [],
+      previousOpponentIds: [],
+    };
+
+    await setDoc(participantDoc, newParticipant);
+    return newParticipant;
+  } catch (error) {
+    const fallbackId = params.participantId || `p-${Date.now()}`;
+    handleFirestoreError(error, OperationType.CREATE, `sessions/${sessionId}/participants/${fallbackId}`);
+  }
+}
+
+export async function updateParticipantRestStatus(
+  sessionId: string,
+  participantId: string,
+  resting: boolean
+): Promise<void> {
+  const ref = doc(db, `sessions/${sessionId}/participants`, participantId);
+  try {
+    await updateDoc(ref, {
+      resting,
+      status: resting ? 'resting' : 'waiting',
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/participants/${participantId}`);
+  }
+}
+
+export async function leaveSession(sessionId: string, participantId: string): Promise<void> {
+  const ref = doc(db, `sessions/${sessionId}/participants`, participantId);
+  try {
+    await updateDoc(ref, {
+      status: 'left',
+      resting: false,
+      leftAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/participants/${participantId}`);
+  }
+}
+
+export async function startMatchOnCourt(
+  sessionId: string,
+  courtId: string,
+  courtName: string,
+  proposal: GroupMatchProposal,
+  matchingMode: MatchingMode | 'manual' = 'balanced'
+): Promise<string> {
+  const courtRef = doc(db, `sessions/${sessionId}/courts`, courtId);
+  const matchRef = doc(collection(db, `sessions/${sessionId}/matches`));
+  const matchId = matchRef.id;
+
+  try {
+    await runTransaction(db, async (txn) => {
+      const courtSnap = await txn.get(courtRef);
+      if (!courtSnap.exists()) {
+        throw new Error('Court not found.');
+      }
+      const courtData = courtSnap.data();
+      if (courtData.status === 'playing') {
+        throw new Error(`${courtName} already has an active match in progress.`);
+      }
+
+      // Read all participants to verify they are not already playing
+      const pSnaps = await Promise.all(
+        proposal.players.map((p) => txn.get(doc(db, `sessions/${sessionId}/participants`, p.participantId)))
+      );
+
+      for (const pSnap of pSnaps) {
+        if (!pSnap.exists()) throw new Error('One or more players no longer exist in session.');
+        const pData = pSnap.data();
+        if (pData.status === 'playing') {
+          throw new Error(`Player ${pData.name} is already playing on another court.`);
+        }
+      }
+
+      // 1. Create Match Doc
+      const newMatch: Match = {
+        matchId,
+        sessionId,
+        courtId,
+        courtName,
+        playerIds: proposal.players.map((p) => p.participantId),
+        playerDetails: proposal.players.map((p) => ({
+          participantId: p.participantId,
+          name: p.name,
+          skillLevel: p.skillLevel,
+        })),
+        teamA: proposal.teamA.map((p) => p.participantId),
+        teamB: proposal.teamB.map((p) => p.participantId),
+        teamANames: proposal.teamA.map((p) => p.name),
+        teamBNames: proposal.teamB.map((p) => p.name),
+        status: 'playing',
+        matchingMode,
+        startedAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      txn.set(matchRef, newMatch);
+
+      // 2. Update Court
+      txn.update(courtRef, {
+        status: 'playing',
+        currentMatchId: matchId,
+        updatedAt: serverTimestamp(),
+      });
+
+      // 3. Update all 4 participants to 'playing'
+      proposal.players.forEach((p) => {
+        const pRef = doc(db, `sessions/${sessionId}/participants`, p.participantId);
+        txn.update(pRef, {
+          status: 'playing',
+          currentCourtId: courtId,
+          currentMatchId: matchId,
+        });
+      });
+    });
+
+    return matchId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `sessions/${sessionId}/matches/${matchId}`);
+  }
+}
+
+export async function completeMatch(
+  sessionId: string,
+  matchId: string,
+  courtId: string,
+  winningTeam: 'teamA' | 'teamB',
+  score?: MatchScore
+): Promise<void> {
+  const matchRef = doc(db, `sessions/${sessionId}/matches`, matchId);
+  const courtRef = doc(db, `sessions/${sessionId}/courts`, courtId);
+
+  try {
+    // 1. Fetch match and court documents with resilient error traps
+    const [matchSnap, courtSnap] = await Promise.all([
+      getDoc(matchRef).catch(() => null),
+      getDoc(courtRef).catch(() => null),
+    ]);
+
+    const matchData = matchSnap?.exists() ? (matchSnap.data() as Match) : null;
+
+    // Gather all participant IDs associated with this match safely
+    let teamA = matchData?.teamA || [];
+    let teamB = matchData?.teamB || [];
+    let playerIds = Array.from(
+      new Set([...(matchData?.playerIds || []), ...teamA, ...teamB])
+    ).filter((id): id is string => Boolean(id && typeof id === 'string' && id.trim().length > 0));
+
+    // Also query participants directly to ensure no player on this court is ever left stranded in 'playing' status
+    try {
+      const participantsOnCourtSnap = await getDocs(
+        query(collection(db, `sessions/${sessionId}/participants`), where('currentCourtId', '==', courtId))
+      );
+      participantsOnCourtSnap.forEach((d) => {
+        if (!playerIds.includes(d.id)) {
+          playerIds.push(d.id);
+        }
+      });
+    } catch (e) {
+      console.warn('Could not query participants on court:', e);
+    }
+
+    // If teamA or teamB was missing or empty, divide playerIds into two teams
+    if (teamA.length === 0 && playerIds.length > 0) {
+      teamA = playerIds.slice(0, Math.ceil(playerIds.length / 2));
+      teamB = playerIds.slice(Math.ceil(playerIds.length / 2));
+    }
+
+    // Determine current max queue position
+    let maxPos = 0;
+    try {
+      const participantsSnap = await getDocs(collection(db, `sessions/${sessionId}/participants`));
+      participantsSnap.forEach((d) => {
+        const pos = d.data().queuePosition || 0;
+        if (pos > maxPos) maxPos = pos;
+      });
+    } catch (e) {
+      console.warn('Could not get max queue position:', e);
+    }
+
+    // Calculate duration
+    let durationSeconds = 600; // default fallback 10m
+    if (matchData?.startedAt) {
+      const startMs = typeof matchData.startedAt?.toMillis === 'function'
+        ? matchData.startedAt.toMillis()
+        : (matchData.startedAt?.seconds ? matchData.startedAt.seconds * 1000 : new Date(matchData.startedAt).getTime());
+      if (!isNaN(startMs) && startMs > 0) {
+        durationSeconds = Math.max(60, Math.floor((Date.now() - startMs) / 1000));
+      }
+    }
+
+    // Fetch participant docs
+    const pDocs = await Promise.all(
+      playerIds.map((pId) => getDoc(doc(db, `sessions/${sessionId}/participants`, pId)).catch(() => null))
+    );
+
+    const winnerIds = (winningTeam === 'teamA' ? teamA : teamB) || [];
+
+    // Use writeBatch for atomic and offline-compatible persistence
+    const batch = writeBatch(db);
+
+    // 1. Update match with setDoc + merge so it works even if match was client-side or offline
+    batch.set(
+      matchRef,
+      {
+        matchId,
+        sessionId,
+        courtId,
+        status: 'completed',
+        endedAt: serverTimestamp(),
+        durationSeconds,
+        winningTeam,
+        score: score || null,
+        playerIds,
+        teamA,
+        teamB,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // 2. Free court with setDoc + merge
+    batch.set(
+      courtRef,
+      {
+        courtId,
+        status: 'available',
+        currentMatchId: null,
+        available: true,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // 3. Update participants and return them to the queue (4 IN / 4 OUT rule)
+    let offset = 1;
+    for (const pSnap of pDocs) {
+      if (!pSnap || !pSnap.exists()) continue;
+
+      const pData = pSnap.data() as Participant;
+      const pId = pData.participantId || pSnap.id;
+      const isWinner = winnerIds.includes(pId);
+      const gamesPlayed = (pData.gamesPlayed || 0) + 1;
+      const wins = (pData.wins || 0) + (isWinner ? 1 : 0);
+      const losses = (pData.losses || 0) + (isWinner ? 0 : 1);
+      const winRate = Math.round((wins / gamesPlayed) * 100);
+
+      // Point tracking
+      const isTeamA = teamA.includes(pId);
+      const teamScore = score ? (isTeamA ? score.teamA : score.teamB) : (isWinner ? 11 : 9);
+      const oppScore = score ? (isTeamA ? score.teamB : score.teamA) : (isWinner ? 9 : 11);
+      const pointsScored = (pData.pointsScored || 0) + teamScore;
+      const pointsConceded = (pData.pointsConceded || 0) + oppScore;
+      const pointDifferential = (pData.pointDifferential || 0) + (teamScore - oppScore);
+
+      // Streak tracking
+      const currentStreak = pData.streak || 0;
+      const streak = isWinner ? (currentStreak >= 0 ? currentStreak + 1 : 1) : 0;
+
+      // Calculate co-play sets for Social Mix tracking
+      const currentPartners = teamA.includes(pId)
+        ? teamA.filter((id) => id !== pId)
+        : teamB.filter((id) => id !== pId);
+      const currentOpponents = teamA.includes(pId) ? teamB : teamA;
+
+      const previousPartners = Array.from(new Set([...(pData.previousPartnerIds || []), ...currentPartners]));
+      const previousOpponents = Array.from(new Set([...(pData.previousOpponentIds || []), ...currentOpponents]));
+
+      const pRef = doc(db, `sessions/${sessionId}/participants`, pId);
+      batch.set(
+        pRef,
+        {
+          status: 'waiting',
+          currentCourtId: null,
+          currentMatchId: null,
+          gamesPlayed,
+          wins,
+          losses,
+          winRate,
+          pointsScored,
+          pointsConceded,
+          pointDifferential,
+          streak,
+          lastMatchResult: isWinner ? 'win' : 'loss',
+          lastPlayedAt: serverTimestamp(),
+          queuePosition: maxPos + offset,
+          queueEnteredAt: serverTimestamp(),
+          previousPartnerIds: previousPartners.slice(-20),
+          previousOpponentIds: previousOpponents.slice(-30),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      offset++;
+    }
+
+    await batch.commit();
+  } catch (error) {
+    console.warn('completeMatch batch error, executing emergency direct court and match release:', error);
+    try {
+      if (matchId) {
+        await setDoc(
+          matchRef,
+          {
+            matchId,
+            sessionId,
+            courtId,
+            status: 'completed',
+            winningTeam,
+            score: score || null,
+            endedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        ).catch(() => {});
+      }
+      if (courtId) {
+        await setDoc(
+          courtRef,
+          {
+            courtId,
+            status: 'available',
+            currentMatchId: null,
+            available: true,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        ).catch(() => {});
+      }
+
+      // Free any players who were marked on this court
+      const strandedSnap = await getDocs(
+        query(collection(db, `sessions/${sessionId}/participants`), where('currentCourtId', '==', courtId))
+      ).catch(() => null);
+
+      if (strandedSnap && !strandedSnap.empty) {
+        let off = 1;
+        for (const docItem of strandedSnap.docs) {
+          await setDoc(
+            docItem.ref,
+            {
+              status: 'waiting',
+              currentCourtId: null,
+              currentMatchId: null,
+              queuePosition: 900 + off++,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          ).catch(() => {});
+        }
+      }
+    } catch (fallbackErr) {
+      console.warn('Direct recovery error:', fallbackErr);
+      handleFirestoreError(error, OperationType.WRITE, `sessions/${sessionId}/matches/${matchId}`);
+    }
+  }
+}
+
+export async function forceResetCourt(sessionId: string, courtId: string): Promise<void> {
+  const courtRef = doc(db, `sessions/${sessionId}/courts`, courtId);
+  try {
+    await setDoc(
+      courtRef,
+      {
+        courtId,
+        status: 'available',
+        currentMatchId: null,
+        available: true,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // Free any participants currently assigned to this court
+    try {
+      const pSnap = await getDocs(
+        query(collection(db, `sessions/${sessionId}/participants`), where('currentCourtId', '==', courtId))
+      );
+      let offset = 1;
+      for (const d of pSnap.docs) {
+        await setDoc(
+          d.ref,
+          {
+            status: 'waiting',
+            currentCourtId: null,
+            currentMatchId: null,
+            queuePosition: 950 + offset++,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        ).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('Error freeing participants on court reset:', e);
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/courts/${courtId}`);
+  }
+}
+
+export async function updateAnnouncementSettings(
+  sessionId: string,
+  settings: AnnouncementSettings
+): Promise<void> {
+  const sessionRef = doc(db, 'sessions', sessionId);
+  try {
+    await updateDoc(sessionRef, {
+      announcementSettings: settings,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}`);
+  }
+}
+
+export async function addCourtToSession(sessionId: string, name: string): Promise<string> {
+  const courtsRef = collection(db, `sessions/${sessionId}/courts`);
+  const courtDoc = doc(courtsRef);
+
+  try {
+    const snap = await getDocs(courtsRef);
+    const order = snap.size + 1;
+
+    const newCourt: Court = {
+      courtId: courtDoc.id,
+      name: name.trim() || `Court ${order}`,
+      status: 'available',
+      currentMatchId: null,
+      available: true,
+      order,
+      updatedAt: serverTimestamp(),
+    };
+
+    await setDoc(courtDoc, newCourt);
+    return courtDoc.id;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `sessions/${sessionId}/courts/${courtDoc.id}`);
+  }
+}
+
+export async function updateCourtState(
+  sessionId: string,
+  courtId: string,
+  updates: Partial<Court>
+): Promise<void> {
+  const ref = doc(db, `sessions/${sessionId}/courts`, courtId);
+  try {
+    await updateDoc(ref, {
+      ...updates,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/courts/${courtId}`);
+  }
+}
+
+export async function removeCourtFromSession(sessionId: string, courtId: string): Promise<void> {
+  const ref = doc(db, `sessions/${sessionId}/courts`, courtId);
+  try {
+    await deleteDoc(ref);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `sessions/${sessionId}/courts/${courtId}`);
+  }
+}
+
+export async function updateSessionMode(sessionId: string, matchingMode: MatchingMode): Promise<void> {
+  const ref = doc(db, `sessions/${sessionId}`);
+  try {
+    await updateDoc(ref, {
+      matchingMode,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}`);
+  }
+}
+
+export async function endSession(sessionId: string): Promise<void> {
+  const sessionRef = doc(db, `sessions/${sessionId}`);
+  try {
+    const batch = writeBatch(db);
+
+    // 1. Mark session as completed
+    batch.update(sessionRef, {
+      status: 'completed',
+      endedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    // 2. Clear all courts so none are left in 'playing' status
+    const courtsRef = collection(db, `sessions/${sessionId}/courts`);
+    const courtsSnap = await getDocs(courtsRef).catch(() => null);
+    if (courtsSnap && !courtsSnap.empty) {
+      courtsSnap.forEach((courtDoc) => {
+        const cData = courtDoc.data();
+        if (cData.status === 'playing' || cData.currentMatchId) {
+          batch.update(courtDoc.ref, {
+            status: 'available',
+            currentMatchId: null,
+            available: true,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+    }
+
+    // 3. Mark any matches that were still in 'playing' or 'ready' status as completed
+    const matchesRef = collection(db, `sessions/${sessionId}/matches`);
+    const activeMatchesSnap = await getDocs(
+      query(matchesRef, where('status', 'in', ['playing', 'ready', 'assigned']))
+    ).catch(() => null);
+
+    if (activeMatchesSnap && !activeMatchesSnap.empty) {
+      activeMatchesSnap.forEach((mDoc) => {
+        batch.update(mDoc.ref, {
+          status: 'completed',
+          endedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      });
+    }
+
+    // 4. Reset any participants who were marked as 'playing' or assigned to a court
+    const participantsRef = collection(db, `sessions/${sessionId}/participants`);
+    const playingParticipantsSnap = await getDocs(
+      query(participantsRef, where('status', '==', 'playing'))
+    ).catch(() => null);
+
+    if (playingParticipantsSnap && !playingParticipantsSnap.empty) {
+      playingParticipantsSnap.forEach((pDoc) => {
+        batch.update(pDoc.ref, {
+          status: 'waiting',
+          currentCourtId: null,
+          currentMatchId: null,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    }
+
+    // Also check for any participant with non-null currentCourtId
+    const strandedParticipantsSnap = await getDocs(participantsRef).catch(() => null);
+    if (strandedParticipantsSnap && !strandedParticipantsSnap.empty) {
+      strandedParticipantsSnap.forEach((pDoc) => {
+        const pData = pDoc.data();
+        if (pData.currentCourtId || pData.currentMatchId) {
+          batch.update(pDoc.ref, {
+            currentCourtId: null,
+            currentMatchId: null,
+            status: pData.status === 'playing' ? 'waiting' : pData.status,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      });
+    }
+
+    // Commit all changes atomically
+    await batch.commit();
+
+    // Update local cache
+    const cached = getCachedSession(sessionId);
+    if (cached) {
+      const updatedSession: Session = {
+        ...cached.session,
+        status: 'completed',
+        endedAt: new Date().toISOString(),
+      };
+      const updatedCourts: Court[] = (cached.courts || []).map((c) => ({
+        ...c,
+        status: 'available',
+        currentMatchId: null,
+        available: true,
+      }));
+      cacheSessionLocally(updatedSession, updatedCourts);
+    }
+  } catch (error) {
+    console.warn('Error ending session cleanly with batch, falling back to direct update:', error);
+    try {
+      await updateDoc(sessionRef, {
+        status: 'completed',
+        endedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (fallbackErr) {
+      handleFirestoreError(fallbackErr, OperationType.UPDATE, `sessions/${sessionId}`);
+    }
+  }
+}
+
+export interface EditMatchScoreParams {
+  newWinningTeam: 'teamA' | 'teamB';
+  newScoreA: number;
+  newScoreB: number;
+  editReason?: string;
+  editedBy?: string;
+}
+
+export async function editSubmittedMatchScore(
+  sessionId: string,
+  matchId: string,
+  params: EditMatchScoreParams
+): Promise<void> {
+  const matchRef = doc(db, `sessions/${sessionId}/matches`, matchId);
+
+  try {
+    const matchSnap = await getDoc(matchRef);
+    if (!matchSnap.exists()) {
+      throw new Error('Match record not found.');
+    }
+
+    const matchData = matchSnap.data() as Match;
+    const oldWinningTeam = matchData.winningTeam || 'teamA';
+    const oldScoreA = matchData.score?.teamA ?? (oldWinningTeam === 'teamA' ? 11 : 9);
+    const oldScoreB = matchData.score?.teamB ?? (oldWinningTeam === 'teamB' ? 11 : 9);
+
+    const newWinningTeam = params.newWinningTeam;
+    const newScoreA = params.newScoreA;
+    const newScoreB = params.newScoreB;
+
+    const winnerChanged = newWinningTeam !== oldWinningTeam;
+    const deltaA = newScoreA - oldScoreA;
+    const deltaB = newScoreB - oldScoreB;
+
+    const teamA = matchData.teamA || [];
+    const teamB = matchData.teamB || [];
+    const allPlayerIds = Array.from(new Set([...teamA, ...teamB]));
+
+    // Read participants to adjust scores and win/loss records
+    const pSnaps = await Promise.all(
+      allPlayerIds.map((id) =>
+        getDoc(doc(db, `sessions/${sessionId}/participants`, id)).catch(() => null)
+      )
+    );
+
+    const batch = writeBatch(db);
+
+    // 1. Update Match Document
+    batch.update(matchRef, {
+      winningTeam: newWinningTeam,
+      score: { teamA: newScoreA, teamB: newScoreB },
+      isEdited: true,
+      editedAt: serverTimestamp(),
+      editReason: params.editReason?.trim() || 'Score adjusted by player / organizer',
+      updatedAt: serverTimestamp(),
+    });
+
+    // 2. Adjust participant stats for Team A and Team B
+    for (const pSnap of pSnaps) {
+      if (!pSnap || !pSnap.exists()) continue;
+      const pData = pSnap.data() as Participant;
+      const pId = pData.participantId || pSnap.id;
+      const isTeamA = teamA.includes(pId);
+      const isTeamB = teamB.includes(pId);
+
+      let wins = pData.wins || 0;
+      let losses = pData.losses || 0;
+      const gamesPlayed = pData.gamesPlayed || 0;
+
+      if (winnerChanged) {
+        if (isTeamA) {
+          if (newWinningTeam === 'teamA') {
+            // Team A went from losing to winning
+            wins = wins + 1;
+            losses = Math.max(0, losses - 1);
+          } else {
+            // Team A went from winning to losing
+            wins = Math.max(0, wins - 1);
+            losses = losses + 1;
+          }
+        } else if (isTeamB) {
+          if (newWinningTeam === 'teamB') {
+            // Team B went from losing to winning
+            wins = wins + 1;
+            losses = Math.max(0, losses - 1);
+          } else {
+            // Team B went from winning to losing
+            wins = Math.max(0, wins - 1);
+            losses = losses + 1;
+          }
+        }
+      }
+
+      const teamDelta = isTeamA ? deltaA : deltaB;
+      const oppDelta = isTeamA ? deltaB : deltaA;
+
+      const pointsScored = Math.max(0, (pData.pointsScored || 0) + teamDelta);
+      const pointsConceded = Math.max(0, (pData.pointsConceded || 0) + oppDelta);
+      const pointDifferential = (pData.pointDifferential || 0) + (teamDelta - oppDelta);
+      const winRate = gamesPlayed > 0 ? Math.round((wins / gamesPlayed) * 100) : 0;
+
+      const lastMatchResult = isTeamA
+        ? newWinningTeam === 'teamA'
+          ? 'win'
+          : 'loss'
+        : newWinningTeam === 'teamB'
+        ? 'win'
+        : 'loss';
+
+      const pRef = doc(db, `sessions/${sessionId}/participants`, pId);
+      batch.update(pRef, {
+        wins,
+        losses,
+        winRate,
+        pointsScored,
+        pointsConceded,
+        pointDifferential,
+        lastMatchResult,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    // 3. Optional Audit Log
+    const auditRef = doc(collection(db, `sessions/${sessionId}/audit_logs`));
+    batch.set(auditRef, {
+      id: auditRef.id,
+      sessionId,
+      action: 'MATCH_SCORE_EDITED',
+      actorName: params.editedBy || 'Score Adjustment',
+      timestamp: serverTimestamp(),
+      metadata: {
+        matchId,
+        oldScore: { teamA: oldScoreA, teamB: oldScoreB, winningTeam: oldWinningTeam },
+        newScore: { teamA: newScoreA, teamB: newScoreB, winningTeam: newWinningTeam },
+        reason: params.editReason || 'Manual adjustment',
+      },
+    });
+
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/matches/${matchId}`);
+  }
+}
+
+export async function bulkImportParticipants(
+  sessionId: string,
+  rawLines: string[],
+  defaultSkill: SkillLevel = 'intermediate'
+): Promise<number> {
+  const participantsRef = collection(db, `sessions/${sessionId}/participants`);
+
+  let maxPos = 0;
+  try {
+    const currentSnap = await getDocs(participantsRef);
+    currentSnap.forEach((d) => {
+      const pos = d.data().queuePosition || 0;
+      if (pos > maxPos) maxPos = pos;
+    });
+  } catch (err) {
+    console.warn('Could not read existing max queue position, defaulting to 0:', err);
+  }
+
+  // Parse and sanitize raw lines (split multi-item strings by newlines, commas, semicolons)
+  const expandedLines: string[] = [];
+  for (const raw of rawLines) {
+    if (!raw || typeof raw !== 'string') continue;
+    // If line contains multiple items separated by commas or semicolons (and not just an annotation like "Davis, intermediate")
+    if (raw.includes('\n')) {
+      expandedLines.push(...raw.split('\n'));
+    } else if (raw.includes(';') || (raw.includes(',') && !raw.match(/,\s*(beginner|intermediate|advanced|beg|int|adv)\b/i))) {
+      expandedLines.push(...raw.split(/[,;]+/));
+    } else {
+      expandedLines.push(raw);
+    }
+  }
+
+  const parsedPlayers: Array<{
+    fullName: string;
+    firstName: string;
+    surname: string;
+    skill: SkillLevel;
+  }> = [];
+
+  for (const raw of expandedLines) {
+    if (!raw || typeof raw !== 'string') continue;
+    // Strip leading numbering or bullet points like "1. ", "2) ", "- ", "• "
+    let clean = raw.trim().replace(/^[\d]+[\.\)\-\s]+/, '').replace(/^[\-\*•\+]\s+/, '').trim();
+    if (!clean) continue;
+
+    // Detect inline skill annotation if present: e.g. "Alex (Advanced)", "Ben - Beginner", "Carla, intermediate"
+    let playerSkill = defaultSkill;
+    const lower = clean.toLowerCase();
+    if (lower.includes('advanced') || lower.includes('(adv)')) {
+      playerSkill = 'advanced';
+      clean = clean.replace(/\(?\[?\b(advanced|adv)\b\)?\]?/i, '').replace(/[\-–,]\s*$/, '').trim();
+    } else if (lower.includes('beginner') || lower.includes('(beg)')) {
+      playerSkill = 'beginner';
+      clean = clean.replace(/\(?\[?\b(beginner|beg)\b\)?\]?/i, '').replace(/[\-–,]\s*$/, '').trim();
+    } else if (lower.includes('intermediate') || lower.includes('(int)')) {
+      playerSkill = 'intermediate';
+      clean = clean.replace(/\(?\[?\b(intermediate|int)\b\)?\]?/i, '').replace(/[\-–,]\s*$/, '').trim();
+    }
+
+    clean = clean.replace(/[,\(\)\[\]\-]+$/, '').trim();
+    if (!clean) continue;
+
+    // Split first and surname
+    const parts = clean.split(/\s+/).filter(Boolean);
+    const firstName = parts[0] || 'Player';
+    const surname = parts.slice(1).join(' ');
+    const fullName = surname ? `${firstName} ${surname}` : firstName;
+
+    parsedPlayers.push({
+      fullName,
+      firstName,
+      surname,
+      skill: playerSkill,
+    });
+  }
+
+  if (parsedPlayers.length === 0) return 0;
+
+  // Chunk batches by 400 to prevent exceeding Firestore 500 operations batch limit
+  const CHUNK_SIZE = 400;
+  let totalCommitted = 0;
+
+  try {
+    for (let i = 0; i < parsedPlayers.length; i += CHUNK_SIZE) {
+      const chunk = parsedPlayers.slice(i, i + CHUNK_SIZE);
+      const batch = writeBatch(db);
+
+      chunk.forEach((p, idx) => {
+        const pDoc = doc(participantsRef);
+        const queuePos = maxPos + totalCommitted + idx + 1;
+        const participantData: Participant = {
+          participantId: pDoc.id,
+          sessionId,
+          name: p.fullName,
+          firstName: p.firstName,
+          surname: p.surname,
+          skillLevel: p.skill,
+          status: 'waiting',
+          queuePosition: queuePos,
+          queueEnteredAt: serverTimestamp(),
+          gamesPlayed: 0,
+          wins: 0,
+          losses: 0,
+          winRate: 0,
+          pointsScored: 0,
+          pointsConceded: 0,
+          pointDifferential: 0,
+          streak: 0,
+          resting: false,
+          checkedIn: true,
+          joinedAt: serverTimestamp(),
+          previousPartnerIds: [],
+          previousOpponentIds: [],
+        };
+        batch.set(pDoc, participantData);
+      });
+
+      await batch.commit();
+      totalCommitted += chunk.length;
+    }
+
+    return totalCommitted;
+  } catch (error) {
+    console.warn('Bulk import batch write warning:', error);
+    if (totalCommitted > 0) return totalCommitted;
+    handleFirestoreError(error, OperationType.WRITE, `sessions/${sessionId}/participants`);
+  }
+}
+
+export async function updateParticipantAvatar(
+  sessionId: string,
+  participantId: string,
+  avatarUrl: string
+): Promise<void> {
+  const pRef = doc(db, `sessions/${sessionId}/participants`, participantId);
+  try {
+    await updateDoc(pRef, {
+      avatarUrl,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/participants/${participantId}`);
+  }
+}
+
+export async function updateParticipantProfile(
+  sessionId: string,
+  participantId: string,
+  updates: {
+    name?: string;
+    firstName?: string;
+    surname?: string;
+    avatarUrl?: string;
+    skillLevel?: SkillLevel;
+  }
+): Promise<void> {
+  const pRef = doc(db, `sessions/${sessionId}/participants`, participantId);
+  try {
+    await updateDoc(pRef, {
+      ...updates,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/participants/${participantId}`);
+  }
+}
+
+export async function updateParticipantSkill(
+  sessionId: string,
+  participantId: string,
+  skillLevel: SkillLevel
+): Promise<void> {
+  const pRef = doc(db, `sessions/${sessionId}/participants`, participantId);
+  try {
+    await updateDoc(pRef, {
+      skillLevel,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `sessions/${sessionId}/participants/${participantId}`);
+  }
+}
+
+export async function lockPartners(
+  sessionId: string,
+  player1: { id: string; name: string },
+  player2: { id: string; name: string }
+): Promise<void> {
+  const batch = writeBatch(db);
+  const p1Ref = doc(db, `sessions/${sessionId}/participants`, player1.id);
+  const p2Ref = doc(db, `sessions/${sessionId}/participants`, player2.id);
+  const sessionRef = doc(db, 'sessions', sessionId);
+
+  batch.update(p1Ref, {
+    lockedPartnerId: player2.id,
+    lockedPartnerName: player2.name,
+    updatedAt: serverTimestamp(),
+  });
+
+  batch.update(p2Ref, {
+    lockedPartnerId: player1.id,
+    lockedPartnerName: player1.name,
+    updatedAt: serverTimestamp(),
+  });
+
+  try {
+    const sSnap = await getDoc(sessionRef);
+    const existingPairs = sSnap.exists() ? (sSnap.data()?.lockedPartners || []) : [];
+    // Filter out if either player was in another pair
+    const filteredPairs = existingPairs.filter(
+      (pair: any) =>
+        pair.id1 !== player1.id &&
+        pair.id2 !== player1.id &&
+        pair.id1 !== player2.id &&
+        pair.id2 !== player2.id
+    );
+    filteredPairs.push({
+      id1: player1.id,
+      id2: player2.id,
+      player1Name: player1.name,
+      player2Name: player2.name,
+      createdAt: new Date().toISOString(),
+    });
+
+    batch.update(sessionRef, {
+      lockedPartners: filteredPairs,
+      updatedAt: serverTimestamp(),
+    });
+
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `sessions/${sessionId}`);
+  }
+}
+
+export async function unlockPartners(
+  sessionId: string,
+  player1Id: string,
+  player2Id: string
+): Promise<void> {
+  const batch = writeBatch(db);
+  const p1Ref = doc(db, `sessions/${sessionId}/participants`, player1Id);
+  const p2Ref = doc(db, `sessions/${sessionId}/participants`, player2Id);
+  const sessionRef = doc(db, 'sessions', sessionId);
+
+  batch.update(p1Ref, {
+    lockedPartnerId: null,
+    lockedPartnerName: null,
+    updatedAt: serverTimestamp(),
+  });
+
+  batch.update(p2Ref, {
+    lockedPartnerId: null,
+    lockedPartnerName: null,
+    updatedAt: serverTimestamp(),
+  });
+
+  try {
+    const sSnap = await getDoc(sessionRef);
+    if (sSnap.exists()) {
+      const existingPairs = sSnap.data()?.lockedPartners || [];
+      const updatedPairs = existingPairs.filter(
+        (pair: any) =>
+          !(
+            (pair.id1 === player1Id && pair.id2 === player2Id) ||
+            (pair.id1 === player2Id && pair.id2 === player1Id)
+          )
+      );
+      batch.update(sessionRef, {
+        lockedPartners: updatedPairs,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `sessions/${sessionId}`);
+  }
+}
+
+export async function bulkImportDetailedParticipants(
+  sessionId: string,
+  players: Array<{
+    name: string;
+    firstName?: string;
+    surname?: string;
+    skillLevel: SkillLevel;
+    avatarUrl?: string;
+  }>
+): Promise<number> {
+  if (!players || players.length === 0) return 0;
+
+  const partsRef = collection(db, `sessions/${sessionId}/participants`);
+  const snap = await getDocs(partsRef).catch(() => null);
+  let maxPos = 0;
+  if (snap && !snap.empty) {
+    snap.docs.forEach((d) => {
+      const qp = d.data().queuePosition;
+      if (typeof qp === 'number' && qp > maxPos) maxPos = qp;
+    });
+  }
+
+  const chunks: Array<typeof players> = [];
+  for (let i = 0; i < players.length; i += 20) {
+    chunks.push(players.slice(i, i + 20));
+  }
+
+  let totalAdded = 0;
+  for (const chunk of chunks) {
+    const batch = writeBatch(db);
+    chunk.forEach((p, idx) => {
+      const newRef = doc(partsRef);
+      maxPos += 1;
+      const cleanName = p.name.trim();
+      const parts = cleanName.split(/\s+/);
+      const fName = p.firstName?.trim() || parts[0] || cleanName;
+      const sName = p.surname?.trim() || parts.slice(1).join(' ') || '';
+
+      const participant: Participant = {
+        participantId: newRef.id,
+        sessionId,
+        name: cleanName,
+        firstName: fName,
+        surname: sName,
+        avatarUrl: p.avatarUrl || '',
+        skillLevel: p.skillLevel || 'intermediate',
+        status: 'waiting',
+        queuePosition: maxPos,
+        queueEnteredAt: serverTimestamp(),
+        gamesPlayed: 0,
+        wins: 0,
+        losses: 0,
+        winRate: 0,
+        resting: false,
+        checkedIn: true,
+        joinedAt: serverTimestamp(),
+        pointsScored: 0,
+        pointsConceded: 0,
+        pointDifferential: 0,
+        streak: 0,
+      };
+
+      batch.set(newRef, participant);
+      totalAdded++;
+    });
+
+    await batch.commit();
+  }
+
+  return totalAdded;
+}
+
+

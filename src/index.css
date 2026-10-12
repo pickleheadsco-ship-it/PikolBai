@@ -1,0 +1,298 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+html, body {
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+@layer utilities {
+  /* Safe area inset helpers for mobile screens with notches / home bars */
+  .pb-safe {
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+  .pt-safe {
+    padding-top: max(0.5rem, env(safe-area-inset-top));
+  }
+
+  /* Claymorphism Base Card */
+  .clay-card {
+    background: #ffffff;
+    box-shadow: 
+      8px 10px 20px rgba(160, 175, 195, 0.35),
+      -6px -6px 16px rgba(255, 255, 255, 0.95),
+      inset 2px 2px 4px rgba(255, 255, 255, 0.9),
+      inset -2px -2px 6px rgba(175, 190, 210, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.6);
+  }
+
+  /* Claymorphism Subcard / Soft Floating Panel */
+  .clay-subcard {
+    background: #f8fafc;
+    box-shadow: 
+      5px 6px 14px rgba(160, 175, 195, 0.25),
+      -4px -4px 10px rgba(255, 255, 255, 0.9),
+      inset 1.5px 1.5px 3px rgba(255, 255, 255, 0.95),
+      inset -1.5px -1.5px 4px rgba(180, 195, 215, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.8);
+  }
+
+  /* Dark Claymorphism */
+  .dark .clay-card,
+  .clay-card-dark {
+    background: #111827;
+    box-shadow: 
+      8px 12px 24px rgba(0, 0, 0, 0.55),
+      -4px -4px 12px rgba(255, 255, 255, 0.04),
+      inset 1.5px 1.5px 3px rgba(255, 255, 255, 0.08),
+      inset -2px -2px 6px rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .dark .clay-subcard {
+    background: #1f2937;
+    box-shadow: 
+      5px 8px 16px rgba(0, 0, 0, 0.45),
+      -3px -3px 8px rgba(255, 255, 255, 0.03),
+      inset 1px 1px 2px rgba(255, 255, 255, 0.06),
+      inset -1.5px -1.5px 4px rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  /* Inset Well / Tactile Input / Pressed Counter */
+  .clay-inset {
+    background: #f1f5f9;
+    box-shadow: 
+      inset 3px 3px 6px rgba(160, 175, 195, 0.35),
+      inset -3px -3px 6px rgba(255, 255, 255, 0.9);
+  }
+
+  .dark .clay-inset,
+  .clay-inset-dark {
+    background: #0b0f19;
+    box-shadow: 
+      inset 3px 3px 6px rgba(0, 0, 0, 0.75),
+      inset -2px -2px 4px rgba(255, 255, 255, 0.03);
+  }
+
+  /* Claymorphism Tactile Buttons */
+  .clay-btn {
+    transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+    user-select: none;
+  }
+  .clay-btn:active {
+    transform: scale(0.97) translateY(1px);
+  }
+
+  .clay-btn-primary {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    box-shadow: 
+      4px 6px 14px rgba(5, 150, 105, 0.4),
+      inset 2px 2px 3px rgba(255, 255, 255, 0.45),
+      inset -2px -2px 4px rgba(4, 120, 87, 0.4);
+    color: #ffffff;
+    font-weight: 700;
+  }
+  .clay-btn-primary:active {
+    box-shadow: 
+      2px 3px 6px rgba(5, 150, 105, 0.4),
+      inset 2px 2px 4px rgba(0, 0, 0, 0.2);
+  }
+
+  .clay-btn-secondary {
+    background: #ffffff;
+    box-shadow: 
+      4px 6px 12px rgba(160, 175, 195, 0.3),
+      -2px -2px 6px rgba(255, 255, 255, 0.9),
+      inset 1.5px 1.5px 2px rgba(255, 255, 255, 1),
+      inset -1.5px -1.5px 3px rgba(180, 195, 215, 0.25);
+    color: #1e293b;
+    font-weight: 700;
+    border: 1px solid rgba(255, 255, 255, 0.8);
+  }
+  .clay-btn-secondary:active {
+    box-shadow: 
+      inset 2px 2px 4px rgba(160, 175, 195, 0.35),
+      inset -2px -2px 4px rgba(255, 255, 255, 0.9);
+  }
+
+  .dark .clay-btn-secondary {
+    background: #1e293b;
+    box-shadow: 
+      4px 6px 12px rgba(0, 0, 0, 0.4),
+      -2px -2px 6px rgba(255, 255, 255, 0.03),
+      inset 1px 1px 2px rgba(255, 255, 255, 0.1),
+      inset -1.5px -1.5px 3px rgba(0, 0, 0, 0.4);
+    color: #f1f5f9;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .dark .clay-btn-secondary:active {
+    box-shadow: 
+      inset 2px 2px 4px rgba(0, 0, 0, 0.6),
+      inset -1px -1px 3px rgba(255, 255, 255, 0.04);
+  }
+
+  .clay-btn-sky {
+    background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+    box-shadow: 
+      4px 6px 14px rgba(2, 132, 199, 0.4),
+      inset 2px 2px 3px rgba(255, 255, 255, 0.45),
+      inset -2px -2px 4px rgba(3, 105, 161, 0.4);
+    color: #ffffff;
+    font-weight: 700;
+  }
+
+  .clay-btn-amber {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    box-shadow: 
+      4px 6px 14px rgba(217, 119, 6, 0.4),
+      inset 2px 2px 3px rgba(255, 255, 255, 0.45),
+      inset -2px -2px 4px rgba(180, 83, 9, 0.4);
+    color: #ffffff;
+    font-weight: 700;
+  }
+
+  .clay-btn-danger {
+    background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%);
+    box-shadow: 
+      4px 6px 14px rgba(225, 29, 72, 0.4),
+      inset 2px 2px 3px rgba(255, 255, 255, 0.45),
+      inset -2px -2px 4px rgba(159, 18, 57, 0.4);
+    color: #ffffff;
+    font-weight: 700;
+  }
+
+  /* Clay Badges */
+  .clay-pill {
+    box-shadow: 
+      2px 3px 6px rgba(160, 175, 195, 0.25),
+      -1px -1px 4px rgba(255, 255, 255, 0.9),
+      inset 1px 1px 2px rgba(255, 255, 255, 0.8),
+      inset -1px -1px 2px rgba(180, 195, 215, 0.2);
+  }
+
+  .dark .clay-pill {
+    box-shadow: 
+      2px 3px 6px rgba(0, 0, 0, 0.4),
+      -1px -1px 3px rgba(255, 255, 255, 0.04),
+      inset 1px 1px 2px rgba(255, 255, 255, 0.08),
+      inset -1px -1px 2px rgba(0, 0, 0, 0.4);
+  }
+
+  /* Claymorphic 3D Podium Pillars & Medals */
+  .clay-podium-gold {
+    background: linear-gradient(145deg, #fbbf24 0%, #f59e0b 45%, #d97706 100%);
+    box-shadow:
+      0 20px 35px -8px rgba(217, 119, 6, 0.55),
+      0 10px 18px -4px rgba(245, 158, 11, 0.4),
+      inset 4px 5px 8px rgba(255, 255, 255, 0.65),
+      inset -4px -6px 12px rgba(180, 83, 9, 0.65);
+    border: 2px solid rgba(254, 240, 138, 0.6);
+  }
+
+  .clay-podium-silver {
+    background: linear-gradient(145deg, #f1f5f9 0%, #cbd5e1 45%, #94a3b8 100%);
+    box-shadow:
+      0 16px 30px -8px rgba(100, 116, 139, 0.45),
+      0 8px 14px -4px rgba(148, 163, 184, 0.35),
+      inset 4px 5px 8px rgba(255, 255, 255, 0.85),
+      inset -4px -6px 12px rgba(71, 85, 105, 0.5);
+    border: 2px solid rgba(255, 255, 255, 0.8);
+  }
+
+  .clay-podium-bronze {
+    background: linear-gradient(145deg, #f97316 0%, #c2410c 45%, #9a3412 100%);
+    box-shadow:
+      0 16px 30px -8px rgba(154, 52, 18, 0.5),
+      0 8px 14px -4px rgba(194, 65, 12, 0.35),
+      inset 4px 5px 8px rgba(255, 237, 213, 0.6),
+      inset -4px -6px 12px rgba(124, 45, 18, 0.7);
+    border: 2px solid rgba(254, 215, 170, 0.5);
+  }
+
+  .clay-circle-avatar {
+    box-shadow:
+      0 12px 24px -4px rgba(15, 23, 42, 0.25),
+      inset 3px 3px 6px rgba(255, 255, 255, 0.8),
+      inset -3px -3px 6px rgba(0, 0, 0, 0.15);
+  }
+
+  .clay-badge-ribbon {
+    box-shadow:
+      0 8px 16px -2px rgba(0, 0, 0, 0.2),
+      inset 2px 2px 4px rgba(255, 255, 255, 0.6),
+      inset -2px -2px 4px rgba(0, 0, 0, 0.2);
+  }
+
+  /* 3D Floating Animation */
+  .animate-float {
+    animation: float-drift 4s ease-in-out infinite alternate;
+  }
+
+  @keyframes float-drift {
+    0% {
+      transform: translateY(0px) rotate(0deg);
+    }
+    50% {
+      transform: translateY(-12px) rotate(2deg);
+    }
+    100% {
+      transform: translateY(4px) rotate(-1.5deg);
+    }
+  }
+
+  /* Global Dark Mode Overrides & Polish */
+  .dark body {
+    background-color: #0b1120;
+    color: #f1f5f9;
+  }
+
+  .dark select,
+  .dark input,
+  .dark textarea {
+    color-scheme: dark;
+  }
+
+  /* Dark mode surface & text tone adaptation */
+  .dark .bg-white:not([data-keep-light]) {
+    background-color: #111827;
+  }
+
+  .dark .bg-slate-50 {
+    background-color: #1e293b;
+  }
+
+  .dark .text-slate-900 {
+    color: #f8fafc;
+  }
+
+  .dark .text-slate-800 {
+    color: #f1f5f9;
+  }
+
+  .dark .text-slate-700 {
+    color: #e2e8f0;
+  }
+
+  .dark .text-slate-600 {
+    color: #cbd5e1;
+  }
+
+  .dark .text-slate-500 {
+    color: #94a3b8;
+  }
+
+  .dark .border-slate-100,
+  .dark .border-slate-200,
+  .dark .border-slate-200\/60,
+  .dark .border-slate-200\/80 {
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+}
+
